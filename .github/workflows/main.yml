@@ -1,0 +1,125 @@
+name: Build RAM PLAYER Phase 1 APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Auto-Extract ZIP & Locate Project Root
+        run: |
+          if [ ! -d "patches" ]; then
+            ZIP_FILE=$(find . -maxdepth 2 -name "*.zip" | head -n 1)
+            if [ -z "$ZIP_FILE" ]; then
+              echo "ERROR: Repo mein na patches/ folder mila na koi .zip file!"
+              ls -la
+              exit 1
+            fi
+            echo "Found ZIP: $ZIP_FILE — extracting..."
+            mkdir -p _extracted
+            unzip -q "$ZIP_FILE" -d _extracted
+            PROJ_DIR=$(dirname "$(find _extracted -name "apktool.yml" | head -n 1)")/..
+            PROJ_DIR=$(cd "$PROJ_DIR" && pwd)
+          else
+            PROJ_DIR=$(pwd)
+          fi
+          echo "PROJ_DIR=$PROJ_DIR" >> "$GITHUB_ENV"
+          echo "Using project root: $PROJ_DIR"
+
+      - name: Install apktool 2.12.0
+        run: |
+          mkdir -p "$HOME/tools"
+          curl -sL https://github.com/iBotPeaches/Apktool/releases/download/v2.12.0/apktool_2.12.0.jar -o "$HOME/tools/apktool.jar"
+          printf '#!/bin/bash\nexec java -Xmx2g -jar "$HOME/tools/apktool.jar" "$@"\n' > "$HOME/tools/apktool"
+          chmod +x "$HOME/tools/apktool"
+          echo "$HOME/tools" >> "$GITHUB_PATH"
+
+      - name: Locate Android SDK tools
+        run: |
+          BT=$(ls -d "$ANDROID_SDK_ROOT/build-tools/"* | sort -V | tail -n 1)
+          echo "BUILD_TOOLS=$BT" >> "$GITHUB_ENV"
+          echo "ANDROID_JAR=$ANDROID_SDK_ROOT/platforms/android-34/android.jar" >> "$GITHUB_ENV"
+          echo "$BT" >> "$GITHUB_PATH"
+
+      - name: Compile Java patches to classes4.dex
+        run: |
+          mkdir -p build_out/cls build_out/dex
+          JAVA_FILES=$(find "$PROJ_DIR/patches" -name "*.java" ! -name "TestHook.java")
+          echo "Compiling: $JAVA_FILES"
+          javac --release 11 -cp "$ANDROID_JAR" -d build_out/cls $JAVA_FILES
+          d8 --release --min-api 23 --lib "$ANDROID_JAR" --output build_out/dex $(find build_out/cls -name '*.class')
+
+      - name: Apply Smali fixes & bump versionCode
+        run: |
+          rm -rf build_out/work && cp -r "$PROJ_DIR/apk-project" build_out/work
+          python3 "$PROJ_DIR/build/axml_vc.py" build_out/work/AndroidManifest.xml 197
+          python3 - <<'PY'
+          # 1. Fix10 hook in Ultra.smali
+          p = 'build_out/work/smali_classes3/com/harindra/iptvpro/ultra/Ultra.smali'
+          s = open(p).read()
+          target = "    :cond_f\n    return v3\n"
+          hook = "    :cond_f\n    invoke-static {p0, v4, p1}, Lcom/harindra/iptvpro/ultra/Fix10;->onHttpError(Ljava/lang/Object;Ljava/lang/Object;I)Z\n\n    move-result v3\n\n    return v3\n"
+          if target in s and "Fix10;->onHttpError" not in s:
+              open(p, 'w').write(s.replace(target, hook, 1))
+
+          # 2. Fix high-register p1 (v20) in PlaybackMonitor.smali using invoke-static/range
+          pm = 'build_out/work/smali_classes3/com/harindra/iptvpro/ultra/PlaybackMonitor.smali'
+          pms = open(pm).read()
+          old_call = "invoke-static {p1}, Lcom/harindra/iptvpro/ultra/DrmPlaybackFix;->hasUnsupportedDrmTrack(Ljava/lang/Object;)Z"
+          new_call = "invoke-static/range {p1 .. p1}, Lcom/harindra/iptvpro/ultra/DrmPlaybackFix;->hasUnsupportedDrmTrack(Ljava/lang/Object;)Z"
+          if old_call in pms:
+              open(pm, 'w').write(pms.replace(old_call, new_call))
+          PY
+
+      - name: Build, inject classes4.dex, zipalign & sign APK
+        env:
+          KEYSTORE_B64: ${{ secrets.RAM_KEYSTORE_B64 }}
+          KEYSTORE_PASS: ${{ secrets.RAM_KEYSTORE_PASS }}
+          KEY_ALIAS: ${{ secrets.RAM_KEY_ALIAS }}
+        run: |
+          apktool b build_out/work -o build_out/base.apk
+          python3 - <<'PY'
+          import zipfile
+          with zipfile.ZipFile('build_out/base.apk', 'r') as src, \
+               zipfile.ZipFile('build_out/unsigned.apk', 'w') as dst:
+              for info in src.infolist():
+                  if info.filename.startswith('META-INF/') and info.filename.upper().endswith(('.SF', '.RSA', '.MF', '.DSA')):
+                      continue
+                  dst.writestr(info, src.read(info.filename), compress_type=info.compress_type)
+              dst.write('build_out/dex/classes.dex', 'classes4.dex', compress_type=zipfile.ZIP_DEFLATED)
+          PY
+          zipalign -f -P 16 4 build_out/unsigned.apk build_out/aligned.apk
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > build_out/release.jks
+            apksigner sign --ks build_out/release.jks \
+              --ks-key-alias "${KEY_ALIAS:-ramplayer}" \
+              --ks-pass "pass:$KEYSTORE_PASS" \
+              --out build_out/RAM-PLAYER-v19.0.10-phase1-release.apk build_out/aligned.apk
+          else
+            keytool -genkeypair -v -keystore build_out/debug.jks -storepass android \
+              -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=RAMPlayer,O=Android,C=IN"
+            apksigner sign --ks build_out/debug.jks --ks-key-alias androiddebugkey \
+              --ks-pass pass:android --out build_out/RAM-PLAYER-v19.0.10-phase1-release.apk build_out/aligned.apk
+          fi
+          apksigner verify --print-certs build_out/RAM-PLAYER-v19.0.10-phase1-release.apk
+
+      - name: Upload Signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RAM-PLAYER-v19.0.10-phase1-APK
+          path: build_out/RAM-PLAYER-v19.0.10-phase1-release.apk
+          
